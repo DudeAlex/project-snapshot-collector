@@ -3,8 +3,7 @@ import java.net.URISyntaxException;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.text.DecimalFormat;
-import java.time.Instant;
-import java.time.ZoneId;
+import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -15,10 +14,41 @@ import com.fasterxml.jackson.databind.ObjectWriter;
 
 public class ProjectSnapshotCollector {
 
+    // ---------------- CONFIG ----------------
+
     private static final Set<String> IGNORED_DIRS = Set.of(
-            ".git", ".idea", "node_modules", "target", "build",
-            "__pycache__", ".gradle", ".vscode"
+            ".git", ".idea", ".vscode", ".gradle", ".mvn", "snapshots",
+            "target", "build", "out", "node_modules", "nbproject", "nbbuild", "dist", "__pycache__"
     );
+
+    private static final Set<String> IGNORED_FILES = Set.of(
+            "mvnw", "mvnw.cmd",
+            "snapshot.json",
+            "projectsnapshotcollector.java",
+            "projectsnapshotcollector.class"
+    );
+
+    private static final String[] SECRET_NAME_PATTERNS = {
+            ".env", "secrets", "secret", "credentials", "keystore", "key", "pem", "p12", "pfx"
+    };
+    private static final String[] BINARY_EXTS = {
+            ".jar",".class",".png",".jpg",".jpeg",".gif",".bmp",".ico",".pdf",".zip",".tar",".gz",".rar",
+            ".7z",".mp4",".mp3",".wav",".mov",".exe",".dll"
+    };
+
+    private static final Set<String> CODE_EXT_WHITELIST = Set.of(
+            ".java",".kt",".kts",".scala",".groovy",
+            ".py",".rb",".go",".rs",
+            ".js",".jsx",".ts",".tsx",
+            ".json",".yml",".yaml",".xml",".properties",".toml",".ini",".gradle",".md",".txt",".html",".htm",".css"
+    );
+
+    // JSON content size cap per file
+    private static final long MAX_JSON_FILE_BYTES = 200 * 1024; // 200KB
+    // TXT content size cap per file (safety)
+    private static final int MAX_TXT_BYTES_PER_FILE  = 500 * 1024; // 500KB
+
+    // ---------------- STATE ----------------
 
     private final Path root;
     private final Path selfPath;
@@ -34,7 +64,7 @@ public class ProjectSnapshotCollector {
 
     // ---------------- MODES ----------------
 
-    /** Mode 1: All files with full content (small files only). */
+    /** Mode 1: All files with full content (for small code/text files). */
     public ProjectSnapshot collectAll() throws IOException {
         List<FileInfo> files = collectMetadata();
         List<FileInfo> withContent = files.stream()
@@ -76,6 +106,8 @@ public class ProjectSnapshotCollector {
                     .filter(p -> IGNORED_DIRS.stream()
                             .noneMatch(part -> p.toString().contains(File.separator + part + File.separator)))
                     .filter(this::notSelf)
+                    .filter(this::notSnapshotArtifacts)
+                    .filter(p -> !isIgnored(p))
                     .map(this::toFileInfo)
                     .map(f -> f.withGitStatus(gitChanges.getOrDefault(f.relativePath(), "clean")))
                     .sorted(Comparator.comparing(FileInfo::relativePath))
@@ -89,6 +121,27 @@ public class ProjectSnapshotCollector {
         } catch (IOException e) {
             return true;
         }
+    }
+
+    private boolean notSnapshotArtifacts(Path p) {
+        String name = p.getFileName().toString().toLowerCase();
+        if (name.startsWith("snapshot-") && (name.endsWith(".json") || name.endsWith(".txt"))) return false;
+        return true;
+    }
+
+    private boolean isIgnored(Path path) {
+        String name = path.getFileName().toString().toLowerCase();
+
+        if (IGNORED_FILES.contains(name)) return true;
+
+        for (String ext : BINARY_EXTS) if (name.endsWith(ext)) return true;
+        for (String pat : SECRET_NAME_PATTERNS) if (name.contains(pat)) return true;
+
+        String rp = root.relativize(path).toString().replace("\\", "/").toLowerCase();
+        if (rp.endsWith("/projectsnapshotcollector.java")) return true;
+        if (rp.endsWith("/projectsnapshotcollector.class")) return true;
+
+        return false;
     }
 
     private Map<String, String> collectGitChanges() {
@@ -142,9 +195,20 @@ public class ProjectSnapshotCollector {
 
     private String readSmallFile(Path path) {
         try {
-            if (Files.exists(path) && Files.size(path) < 200 * 1024) { // 200KB max
-                return Files.readString(path);
-            }
+            if (!Files.exists(path)) return null;
+
+            String name = path.getFileName().toString().toLowerCase();
+
+            for (String ext : BINARY_EXTS) if (name.endsWith(ext)) return null;
+            for (String pat : SECRET_NAME_PATTERNS) if (name.contains(pat)) return null;
+
+            long size = Files.size(path);
+            if (size >= MAX_JSON_FILE_BYTES) return null;
+
+            String ext = name.contains(".") ? name.substring(name.lastIndexOf(".")) : "";
+            if (!CODE_EXT_WHITELIST.contains(ext)) return null;
+
+            return Files.readString(path);
         } catch (IOException ignored) {}
         return null;
     }
@@ -152,14 +216,23 @@ public class ProjectSnapshotCollector {
     private String guessLanguage(Path path) {
         String name = path.getFileName().toString().toLowerCase();
         if (name.endsWith(".java")) return "Java";
+        if (name.endsWith(".kt") || name.endsWith(".kts")) return "Kotlin";
+        if (name.endsWith(".scala")) return "Scala";
+        if (name.endsWith(".groovy")) return "Groovy";
         if (name.endsWith(".py")) return "Python";
         if (name.endsWith(".ts")) return "TypeScript";
+        if (name.endsWith(".tsx")) return "TSX";
         if (name.endsWith(".js")) return "JavaScript";
+        if (name.endsWith(".jsx")) return "JSX";
         if (name.endsWith(".md")) return "Markdown";
         if (name.endsWith(".json")) return "JSON";
         if (name.endsWith(".yml") || name.endsWith(".yaml")) return "YAML";
         if (name.endsWith(".xml")) return "XML";
         if (name.endsWith(".html") || name.endsWith(".htm")) return "HTML";
+        if (name.endsWith(".css")) return "CSS";
+        if (name.endsWith(".properties")) return "Properties";
+        if (name.endsWith(".toml")) return "TOML";
+        if (name.endsWith(".ini")) return "INI";
         return "Other";
     }
 
@@ -170,41 +243,53 @@ public class ProjectSnapshotCollector {
         return new DecimalFormat("#.##").format(bytes / Math.pow(1024, exp)) + " " + pre + "B";
     }
 
-    // ---------------- SNAPSHOT CONTAINER ----------------
+    // ---------------- SNAPSHOT CONTAINERS ----------------
 
-    public static class ProjectSnapshot {
-        private final String rootPath;
-        private final List<FileInfo> files;
-
-        public ProjectSnapshot(String rootPath, List<FileInfo> files) {
-            this.rootPath = rootPath;
-            this.files = files;
-        }
-
+    public static record ProjectSnapshot(String rootPath, List<FileInfo> files) {
         @Override
         public String toString() {
             StringBuilder sb = new StringBuilder("📂 Project Snapshot at: " + rootPath + "\n");
             for (FileInfo file : files) {
-                sb.append(" - ").append(file.relativePath)
-                        .append(" | ").append(file.language)
-                        .append(" | ").append(file.size)
-                        .append(" | modified ").append(file.modified)
-                        .append(" | git: ").append(file.gitStatus());
-                if (file.content != null) {
-                    sb.append("\n   ⮑ Content (truncated): ")
-                      .append(file.content.substring(0, Math.min(200, file.content.length())))
-                      .append(file.content.length() > 200 ? "..." : "");
-                }
-                sb.append("\n");
+                sb.append(" - ").append(file.relativePath())
+                        .append(" | ").append(file.language())
+                        .append(" | ").append(file.size())
+                        .append(" | modified ").append(file.modified())
+                        .append(" | git: ").append(file.gitStatus())
+                        .append("\n");
             }
             return sb.toString();
         }
 
-        /** Save snapshot as JSON */
         public void saveAsJson(Path output) throws IOException {
             ObjectMapper mapper = new ObjectMapper();
             ObjectWriter writer = mapper.writerWithDefaultPrettyPrinter();
             writer.writeValue(output.toFile(), this);
+        }
+
+        /** Save snapshot as TXT; if printContents==true, include full bodies (capped). */
+        public void saveAsText(Path output, boolean printContents) throws IOException {
+            try (BufferedWriter writer = Files.newBufferedWriter(output)) {
+                writer.write("📂 Project Snapshot at: " + rootPath + "\n\n");
+                for (FileInfo file : files) {
+                    writer.write("══════════════════════════════════════════════════════════════\n");
+                    writer.write("📄 " + file.relativePath() + " (" + file.language() + ", " + file.size()
+                            + ", modified " + file.modified() + ", git: " + file.gitStatus() + ")\n");
+                    if (printContents && file.content() != null) {
+                        writer.write("──────────────── FILE CONTENT ────────────────\n");
+                        String content = file.content();
+                        byte[] utf8 = content.getBytes();
+                        if (utf8.length > MAX_TXT_BYTES_PER_FILE) {
+                            int safeLen = Math.min(content.length(), MAX_TXT_BYTES_PER_FILE);
+                            writer.write(content.substring(0, safeLen));
+                            writer.write("\n…(truncated in TXT)\n");
+                        } else {
+                            writer.write(content);
+                            writer.write("\n");
+                        }
+                    }
+                    writer.write("\n");
+                }
+            }
         }
     }
 
@@ -235,22 +320,42 @@ public class ProjectSnapshotCollector {
         String choice = scanner.nextLine().trim();
 
         ProjectSnapshot snapshot;
+        boolean printTxtBodies;
         switch (choice) {
-            case "1" -> snapshot = collector.collectAll();
-            case "2" -> snapshot = collector.collectGitDiff();
-            case "3" -> snapshot = collector.collectMinimal();
+            case "1" -> {
+                snapshot = collector.collectAll();
+                printTxtBodies = true;   // <— include FULL CONTENTS in TXT for Mode 1
+            }
+            case "2" -> {
+                snapshot = collector.collectGitDiff();
+                printTxtBodies = false;  // index-only
+            }
+            case "3" -> {
+                snapshot = collector.collectMinimal();
+                printTxtBodies = false;  // index-only
+            }
             default -> {
                 System.out.println("Invalid choice, defaulting to minimal.");
                 snapshot = collector.collectMinimal();
+                printTxtBodies = false;
             }
         }
 
-        // Print report
+        // Print concise index to console
         System.out.println(snapshot);
 
-        // Save JSON too
-        Path outFile = currentDir.resolve("snapshot.json");
-        snapshot.saveAsJson(outFile);
-        System.out.println("✅ Snapshot saved to " + outFile);
+        // Save JSON + TXT snapshot with timestamp down to seconds
+        String timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").format(LocalDateTime.now());
+        Path snapshotsDir = currentDir.resolve("snapshots");
+        Files.createDirectories(snapshotsDir);
+
+        Path jsonOut = snapshotsDir.resolve("snapshot-" + timestamp + ".json");
+        Path txtOut  = snapshotsDir.resolve("snapshot-" + timestamp + ".txt");
+
+        snapshot.saveAsJson(jsonOut);
+        snapshot.saveAsText(txtOut, printTxtBodies);
+
+        System.out.println("✅ Snapshot saved to " + jsonOut);
+        System.out.println("✅ Snapshot saved to " + txtOut);
     }
 }
